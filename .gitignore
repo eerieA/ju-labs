@@ -1,0 +1,38 @@
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb~  # temporary notebook backups
+
+# --- Python virtual environments ---
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# --- Python build and cache files ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# --- Julia ---
+# compiled and package cache
+.julia/
+*.ji
+
+# --- Jupyter Lab / VSCode / IDE settings ---
+.ipython/
+.jupyter/
+.vscode/
+.idea/
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
