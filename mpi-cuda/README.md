@@ -15,7 +15,7 @@ Linux/IOS
 export JULIA_NUM_THREADS=8
 ```
 
-Windows
+Windows Power shell
 
 ```bash
 $env:JULIA_NUM_THREADS="8"
