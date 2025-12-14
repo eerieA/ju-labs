@@ -24,7 +24,7 @@
     - [7. Summary](#7-summary)
 - [GPU specific parallel pattern](#gpu-specific-parallel-pattern)
 - [Why is GPU parallel so different than CPU](#why-is-gpu-parallel-so-different-than-cpu)
-    - [1. CPU vs GPU threads — they are fundamentally different](#1-cpu-vs-gpu-threads--they-are-fundamentally-different)
+    - [1. CPU vs GPU threads - they are fundamentally different](#1-cpu-vs-gpu-threads---they-are-fundamentally-different)
         - [1.1 CPU threads](#11-cpu-threads)
         - [1.2 GPU “threads”](#12-gpu-threads)
     - [2. Why the GPU code explicitly has upsweep + downsweep](#2-why-the-gpu-code-explicitly-has-upsweep--downsweep)
@@ -44,6 +44,20 @@
     - [3. Practical differences](#3-practical-differences)
     - [4. Why dynamic version failed](#4-why-dynamic-version-failed)
     - [5. Recommendation](#5-recommendation)
+- [How warp-level scans reduce sync overhead](#how-warp-level-scans-reduce-sync-overhead)
+    - [1. The fundamental observation](#1-the-fundamental-observation)
+    - [2. Cost of our current Blelloch scan](#2-cost-of-our-current-blelloch-scan)
+    - [3. Warp-level scan: the basic idea](#3-warp-level-scan-the-basic-idea)
+    - [4. Warp-level primitives in CUDA.jl](#4-warp-level-primitives-in-cudajl)
+    - [5. Step-by-step warp scan (inclusive)](#5-step-by-step-warp-scan-inclusive)
+    - [6. Block-wide scan using warps (outline)](#6-block-wide-scan-using-warps-outline)
+        - [Phase 1 - Warp-local scan](#phase-1---warp-local-scan)
+        - [Phase 2 - Scan warp sums](#phase-2---scan-warp-sums)
+        - [Phase 3 - Uniform add](#phase-3---uniform-add)
+    - [7. Synchronization comparison](#7-synchronization-comparison)
+    - [8. Why this works safely](#8-why-this-works-safely)
+    - [9. CUDA.jl-style sketch (simplified)](#9-cudajl-style-sketch-simplified)
+    - [10. Practical consequence](#10-practical-consequence)
 
 <!-- /TOC -->
 
@@ -490,7 +504,7 @@ Below is a precise, engineering-oriented explanation of **why the GPU kernel exp
 
 ---
 
-## 1. CPU vs GPU threads — they are fundamentally different
+## 1. CPU vs GPU threads - they are fundamentally different
 
 ### 1.1 CPU threads
 
@@ -868,4 +882,205 @@ For educational GPU-programming, especially under CUDA.jl:
   * we write kernels to be reused for multiple input sizes
 * Move to **dynamic shared memory** only when scaling beyond fixed-size blocks.
 
-Professional GPU codebases (e.g., Thrust, CUB, CUDA primitives) typically use dynamic shared memory because they need generality — but they also include highly defensive code to handle alignment and block sizing.
+Professional GPU codebases (e.g., Thrust, CUB, CUDA primitives) typically use dynamic shared memory because they need generality - but they also include highly defensive code to handle alignment and block sizing.
+
+
+# How warp-level scans reduce sync overhead
+
+A technique called **warp-level scans** reduces synchronization overhead. It is used in some libraries. We are not implementing that, but it is nice to know how it helps. Because we have seen how our pedagogical version without warp-level scans is not that fast.
+
+This explanation quickly starts to use our Blelloch implementation as an example for illustration, since we are familiar with it.
+
+---
+
+## 1. The fundamental observation
+
+A **warp** (typically 32 threads) has two crucial properties:
+
+1. All threads in a warp execute in **lockstep** (SIMT)
+2. Warp-level instructions are **implicitly synchronized**
+
+Therefore:
+
+> **Within a warp, no `sync_threads()` is required.**
+
+This is the key to reducing synchronization overhead.
+
+---
+
+## 2. Cost of our current Blelloch scan
+
+For a block of `n` threads, Blelloch requires:
+
+* `log₂(n)` barriers in the upsweep
+* `log₂(n)` barriers in the downsweep
+
+Total:
+
+```
+2·log₂(n) sync_threads()
+```
+
+For `n = 1024`, this is **20 full-block barriers**, each stalling all warps.
+
+---
+
+## 3. Warp-level scan: the basic idea
+
+We decompose the scan hierarchically:
+
+1. **Each warp scans its own 32 elements**
+
+   * No barriers
+   * Use warp shuffle instructions
+2. **One warp scans the per-warp sums**
+
+   * Very small problem (≤ 32 values)
+3. **Each warp adds its prefix offset**
+
+   * Again, no barriers inside the warp
+
+Only **two block-level synchronizations** are required.
+
+---
+
+## 4. Warp-level primitives in CUDA.jl
+
+CUDA.jl exposes warp shuffles via `shfl_*` intrinsics.
+
+The most common one for scans:
+
+```julia
+shfl_up_sync(mask, value, offset)
+```
+
+* Moves `value` from lane `laneId - offset`
+* Only within the same warp
+* Implicitly synchronized
+
+---
+
+## 5. Step-by-step warp scan (inclusive)
+
+Within a warp:
+
+```julia
+lane = (threadIdx().x - 1) % warpSize()
+x = data[tid]
+
+for offset in (1, 2, 4, 8, 16)
+    y = shfl_up_sync(0xffffffff, x, offset)
+    if lane ≥ offset
+        x += y
+    end
+end
+```
+
+Key points:
+
+* No shared memory
+* No `sync_threads()`
+* All communication is register-to-register
+
+---
+
+## 6. Block-wide scan using warps (outline)
+
+### Phase 1 - Warp-local scan
+
+Each warp computes:
+
+* `x` = prefix sum within warp
+* The **last lane** writes its warp sum to shared memory
+
+```julia
+if lane == warpSize() - 1
+    warp_sums[warp_id] = x
+end
+```
+
+One `sync_threads()` after this.
+
+---
+
+### Phase 2 - Scan warp sums
+
+Only the **first warp** participates:
+
+```julia
+if warp_id == 0
+    # scan warp_sums using shuffles
+end
+```
+
+Another `sync_threads()`.
+
+---
+
+### Phase 3 - Uniform add
+
+Each warp adds its scanned offset:
+
+```julia
+if warp_id > 0
+    x += warp_sums[warp_id - 1]
+end
+```
+
+No barrier needed afterward.
+
+---
+
+## 7. Synchronization comparison
+
+| Method                 | Barriers (`sync_threads`) |
+| ---------------------- | ------------------------- |
+| Blelloch (block-wide)  | `2·log₂(n)`               |
+| Warp-hierarchical scan | **2 total**               |
+
+For `n = 1024`:
+
+* Blelloch: 20 barriers
+* Warp-level: 2 barriers
+
+This is a **dramatic reduction** in stall time.
+
+---
+
+## 8. Why this works safely
+
+* Warp execution is **implicitly synchronized**
+* Shuffle operations are **deterministic and race-free**
+* Shared memory is touched only at warp boundaries
+* Barriers are used only where cross-warp visibility is required
+
+---
+
+## 9. CUDA.jl-style sketch (simplified)
+
+```julia
+function warp_scan(x)
+    lane = (threadIdx().x - 1) % warpSize()
+    for offset in (1, 2, 4, 8, 16)
+        y = shfl_up_sync(0xffffffff, x, offset)
+        if lane ≥ offset
+            x += y
+        end
+    end
+    return x
+end
+```
+
+This function contains **zero barriers** and replaces an entire Blelloch level.
+
+---
+
+## 10. Practical consequence
+
+Modern high-performance scan implementations:
+
+* Rarely use full-block Blelloch anymore
+* Use warp-level scans + minimal block sync
+* Scale efficiently to thousands of elements
+
+This is how CUDA libraries such as **CUB** and **Thrust** implement scans internally.
