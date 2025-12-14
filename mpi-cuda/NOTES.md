@@ -120,7 +120,7 @@ That thread would operate on element 2049 in the array.
 
 ## 3. Applying this to the Blelloch scan kernel
 
-The version in [blelloch-para-gpu.ipynb](./blelloch-para-gpu.ipynb) uses a **single block**, so:
+The 1st version in [prefixsum-para-gpu-static.ipynb](./prefixsum-para-gpu-static.ipynb) uses a **single block**, so:
 
 * `blockIdx().x == 1`
 * only `threadIdx().x` matters.
