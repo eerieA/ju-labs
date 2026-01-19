@@ -7,6 +7,7 @@ Julia packages
 - Plots
 - ProgressMeter
 - CUDA
+- Printf
 
 # How to set env var for CPU threads
 
